@@ -3,4 +3,6 @@ langchain-community
 chromadb
 pypdf
 pytest
-boto3  # utile si tu gardes Bedrock, sinon tu peux l’enlever
+boto3 
+fastapi
+uvicorn # utile si tu gardes Bedrock, sinon tu peux l’enlever

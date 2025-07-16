@@ -6,3 +6,5 @@ pytest
 boto3 
 fastapi
 uvicorn # utile si tu gardes Bedrock, sinon tu peux l’enlever
+torch
+langchain-chroma

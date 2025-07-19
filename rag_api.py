@@ -28,15 +28,58 @@ CHROMA_PATH = "fmea_chroma"
 
 PROMPT_TEMPLATE = """
 You are a professional assistant specialized in the FMEA module on Digitop.
-Follow these rules:
-- Use official documentation ONLY.
-- Answer clearly and concisely.
-- For processes, give numbered steps with imperative verbs.
-- If undocumented: "This action is not documented. Please ask a different question related to FMEA on Digitop."
+Input Categories and Response Types
+1. Greetings and Thanks
+Input examples: "Hello", "Hi", "Good morning", "Thank you", "Thanks", "Goodbye"
+Response format: Brief, friendly acknowledgment followed by offer to help
+Example: "Hello! I'm here to help you with FMEA processes in Digitop. What would you like to know?"
+2. Procedural Questions (Step-by-step guidance)
+Input examples: "How to create FMEA template", "How to add failure modes", "Steps to complete risk assessment"
+Response format:
+
+Numbered step-by-step instructions
+Use exact button names from documentation
+Include imperative verbs
+Be precise and actionable
+
+Example format:
+
+Click on "New Template" button
+Enter template name in the "Template Name" field
+Select project type from the dropdown menu
+Click "Save" to create the template
+
+3. Informational Questions (Simple definitions)
+Input examples: "What is FMEA?", "What does RPN mean?", "Explain severity rating"
+Response format:
+
+Brief, direct definition based on RAG documents
+No additional context unless specifically in the documentation
+
+Semantic Understanding Rules
+
+Recognize questions with similar meanings even if worded differently
+Examples of equivalent questions:
+
+"How to make new FMEA?" = "How to create FMEA template?"
+"What's the process for adding risks?" = "How to add failure modes?"
+"Steps to finish analysis" = "How to complete FMEA?"
+
+Rules:
+1. Answer ONLY using the information provided in the "Context" below. Do not rephrase or invent anything.
+2. Provide the complete step-by-step answer as is, no truncation.
+3. If the context does not contain the answer, reply exactly:
+   "This action is not documented. Please ask a different question related to FMEA on Digitop."
+4. Return the steps exactly as they appear in the context, without adding extra notes or comments.
+5. Do not mention that the layout or wording may vary.
+6.answer politely if user say thanks ,thank you or any other type of thanking
+
 Context:
 {context}
 
 Question: {question}
+
+Answer:
 """
 
 # Models Pydantic
@@ -56,6 +99,16 @@ async def lifespan(app: FastAPI):
     try:
         # Initialiser la base Chroma avec la fonction d'embedding
         db = Chroma(persist_directory=CHROMA_PATH, embedding_function=get_embedding_function())
+
+        # Debug: Vérifier si la base contient des documents
+        num_docs = 0
+        try:
+            results = db.similarity_search_with_score("", k=1)
+            num_docs = len(results)
+        except Exception as e:
+            logger.warning(f"Could not fetch documents from Chroma DB: {e}")
+
+        logger.info(f"Chroma DB loaded with {num_docs} documents.")
 
         # Initialiser OllamaLLM sans paramètres interdits
         model = OllamaLLM(
@@ -100,6 +153,17 @@ app.add_middleware(
 async def health_check():
     return {"status": "healthy", "db_ready": db is not None, "model_ready": model is not None}
 
+@app.get("/db/status")
+async def db_status():
+    if db is None:
+        return {"status": "Chroma DB not initialized"}
+    try:
+        results = db.similarity_search_with_score("", k=1)
+        count = len(results)
+        return {"status": "ok", "documents_found": count}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 @app.post("/ask", response_model=QueryResponse)
 async def ask_question(request: QueryRequest):
     global db, model
@@ -113,7 +177,9 @@ async def ask_question(request: QueryRequest):
         if not results:
             return QueryResponse(answer="No relevant info found in docs. Please ask something else.", sources=[])
 
-        context_text = "\n---\n".join([doc.page_content[:400] for doc, _ in results])
+        # Ne plus tronquer, prendre le contenu intégral
+        context_text = "\n---\n".join([doc.page_content for doc, _ in results])
+
         prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         prompt = prompt_template.format(context=context_text, question=request.question)
 
@@ -143,7 +209,8 @@ async def stream_response(request: QueryRequest):
     if not results:
         return StreamingResponse(iter(["No relevant info found."]), media_type="text/plain")
 
-    context_text = "\n---\n".join([doc.page_content[:400] for doc, _ in results])
+    # Ne plus tronquer ici non plus
+    context_text = "\n---\n".join([doc.page_content for doc, _ in results])
     prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     prompt = prompt_template.format(context=context_text, question=request.question)
 
@@ -158,8 +225,7 @@ async def stream_response(request: QueryRequest):
 
 @app.get("/")
 async def root():
-    return {"message": "FMEA RAG API running", "endpoints": ["/ask", "/ask/stream", "/health"]}
-
+    return {"message": "FMEA RAG API running", "endpoints": ["/ask", "/ask/stream", "/health", "/db/status"]}
 
 if __name__ == "__main__":
     import uvicorn

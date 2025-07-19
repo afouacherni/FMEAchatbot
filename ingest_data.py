@@ -45,7 +45,7 @@ def add_to_chroma(chunks: list[Document]):
     new_chunks = [chunk for chunk in chunks if chunk.metadata["id"] not in existing_ids]
     if new_chunks:
         db.add_documents(new_chunks, ids=[c.metadata["id"] for c in new_chunks])
-        db.persist()
+    
         print(f"✅ Added {len(new_chunks)} new FMEA chunks.")
     else:
         print("🔁 No new chunks to add.")

@@ -11,7 +11,11 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_ollama import OllamaLLM
 from contextlib import asynccontextmanager
 
-# Import ta fonction d'embedding depuis ton fichier get_embedding_function.py
+# Forcer PyTorch à utiliser CPU si aucun GPU n'est disponible
+if not torch.cuda.is_available():
+    torch.set_default_device("cpu")
+
+# Import de la fonction d'embedding
 from get_embedding_function import get_embedding_function
 
 # Désactiver télémétrie LangChain
@@ -20,7 +24,7 @@ os.environ["LANGCHAIN_API_KEY"] = ""
 
 # Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rag_api")
 
 db = None
 model = None
@@ -41,13 +45,6 @@ Numbered step-by-step instructions
 Use exact button names from documentation
 Include imperative verbs
 Be precise and actionable
-
-Example format:
-
-Click on "New Template" button
-Enter template name in the "Template Name" field
-Select project type from the dropdown menu
-Click "Save" to create the template
 
 3. Informational Questions (Simple definitions)
 Input examples: "What is FMEA?", "What does RPN mean?", "Explain severity rating"
@@ -72,7 +69,16 @@ Rules:
    "This action is not documented. Please ask a different question related to FMEA on Digitop."
 4. Return the steps exactly as they appear in the context, without adding extra notes or comments.
 5. Do not mention that the layout or wording may vary.
-6.answer politely if user say thanks ,thank you or any other type of thanking
+6. Answer politely if user says thanks, thank you or any other type of thanking.
+7. Provide the full step-by-step instructions completely and do not truncate or shorten the steps.
+   If the steps are long, include all without skipping any.
+   Answer fully as per the documentation context.
+8. The steps must be numbered step by step (obligation).
+9.
+- If the context contains multiple procedures, select only the one where the question text matches exactly (case-insensitive) the procedure title in the context.
+- If there is no exact match, respond with:
+  "This action is not documented. Please ask a different question related to FMEA on Digitop."
+
 
 Context:
 {context}
@@ -82,7 +88,7 @@ Question: {question}
 Answer:
 """
 
-# Models Pydantic
+# Pydantic Models
 class QueryRequest(BaseModel):
     question: str
 
@@ -90,47 +96,48 @@ class QueryResponse(BaseModel):
     answer: str
     sources: list[str]
 
-# Startup et lifespan FastAPI
+# Fonction pour charger le modèle à la demande
+def get_model():
+    global model
+    if model is None:
+        logger.info("Loading Ollama model (lazy)...")
+        model = OllamaLLM(
+            model="llama3.2:latest",
+            num_ctx=1024,      # Réduction du contexte
+            num_predict=256,  # Réduction du nombre de tokens générés
+            temperature=0.3,
+            keep_alive="5m"
+        )
+    return model
+
+# Startup et lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, model
-    logger.info("Initializing Chroma and Ollama model...")
-
+    global db
+    logger.info("Initializing Chroma...")
     try:
-        # Initialiser la base Chroma avec la fonction d'embedding
         db = Chroma(persist_directory=CHROMA_PATH, embedding_function=get_embedding_function())
 
-        # Debug: Vérifier si la base contient des documents
-        num_docs = 0
         try:
             results = db.similarity_search_with_score("", k=1)
             num_docs = len(results)
         except Exception as e:
             logger.warning(f"Could not fetch documents from Chroma DB: {e}")
-
+            num_docs = 0
         logger.info(f"Chroma DB loaded with {num_docs} documents.")
-
-        # Initialiser OllamaLLM sans paramètres interdits
-        model = OllamaLLM(
-            model="llama3.2:latest",
-            num_ctx=1024,
-            num_predict=256,
-            temperature=0.3,
-            keep_alive="5m"
-        )
-
-        logger.info("Resources loaded successfully.")
     except Exception as e:
-        logger.error(f"Initialization error: {e}")
+        logger.error(f"Initialization error: {e}", exc_info=True)
         raise
 
     yield
-
     logger.info("Cleaning up resources...")
     cleanup_resources()
 
 def cleanup_resources():
+    """Nettoyage mémoire agressif."""
+    global model
     try:
+        model = None  # Libérer le modèle
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -141,6 +148,7 @@ def cleanup_resources():
 
 app = FastAPI(lifespan=lifespan)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -151,7 +159,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "db_ready": db is not None, "model_ready": model is not None}
+    return {"status": "healthy", "db_ready": db is not None}
 
 @app.get("/db/status")
 async def db_status():
@@ -166,10 +174,12 @@ async def db_status():
 
 @app.post("/ask", response_model=QueryResponse)
 async def ask_question(request: QueryRequest):
-    global db, model
+    global db
     try:
-        if db is None or model is None:
+        if db is None:
             raise HTTPException(status_code=500, detail="Service not ready")
+
+        model = get_model()  # Charger le modèle ici
 
         logger.info(f"Received question: {request.question}")
 
@@ -177,19 +187,15 @@ async def ask_question(request: QueryRequest):
         if not results:
             return QueryResponse(answer="No relevant info found in docs. Please ask something else.", sources=[])
 
-        # Ne plus tronquer, prendre le contenu intégral
         context_text = "\n---\n".join([doc.page_content for doc, _ in results])
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE).format(
+            context=context_text, question=request.question
+        )
 
-        prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-        prompt = prompt_template.format(context=context_text, question=request.question)
-
-        response_text = ""
-        for chunk in model.stream(prompt):
-            response_text += chunk
-
+        response_text = "".join(model.stream(prompt))
         sources = [doc.metadata.get("id", "unknown") for doc, _ in results]
-        cleanup_resources()
 
+        cleanup_resources()  # Libérer la mémoire
         return QueryResponse(answer=response_text, sources=sources)
 
     except Exception as e:
@@ -199,9 +205,11 @@ async def ask_question(request: QueryRequest):
 
 @app.post("/ask/stream")
 async def stream_response(request: QueryRequest):
-    global db, model
-    if db is None or model is None:
+    global db
+    if db is None:
         raise HTTPException(status_code=500, detail="Service not ready")
+
+    model = get_model()
 
     logger.info(f"Streaming answer for: {request.question}")
 
@@ -209,10 +217,10 @@ async def stream_response(request: QueryRequest):
     if not results:
         return StreamingResponse(iter(["No relevant info found."]), media_type="text/plain")
 
-    # Ne plus tronquer ici non plus
     context_text = "\n---\n".join([doc.page_content for doc, _ in results])
-    prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-    prompt = prompt_template.format(context=context_text, question=request.question)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE).format(
+        context=context_text, question=request.question
+    )
 
     async def generate():
         try:
